@@ -52,8 +52,9 @@ createApp({
     const user=ref(localStorage.getItem('keyremap_user')||'');
     const username=ref('admin'), password=ref('123456'), err=ref(''), actionErr=ref('');
     const leftTab=ref(0), rightTab=ref(0);
-    const versions=ref([]), mappings=ref([]), formal=ref([]), conflicts=ref([]);
+    const versions=ref([]), mappings=ref([]), formal=ref([]), conflicts=ref([]), cutovers=ref([]), reconcile=ref(null);
     const oldKey=ref('OLD-B1');
+    const cutVersion=ref('m-2026.12'), cutFrom=ref('2026-11-20'), cutText=ref('OLD-A1,NEW-101,一对一\nOLD-B1,NEW-201,多对一'), cutMsg=ref('');
     function auth(){return {Authorization:'Bearer '+token.value,'Content-Type':'application/json'};}
     async function login(){
       err.value='';
@@ -80,6 +81,20 @@ createApp({
       formal.value=Array.isArray(f.items)?f.items:[];
       const c=await loadJson('/api/conflicts'); if(c===null) return;
       conflicts.value=Array.isArray(c.items)?c.items:[];
+      const r=await loadJson('/api/reconcile'); if(r===null) return;
+      reconcile.value=r;
+      const l=await loadJson('/api/cutovers'); if(l===null) return;
+      cutovers.value=Array.isArray(l.items)?l.items:[];
+    }
+    async function doCutover(){
+      cutMsg.value='';
+      const mappings=cutText.value.split('\n').map(s=>s.trim()).filter(Boolean).map(line=>{
+        const p=line.split(','); return {old_key:(p[0]||'').trim(),new_key:(p[1]||'').trim(),kind:(p[2]||'').trim()};
+      });
+      const r=await fetch('/api/cutover',{method:'POST',headers:auth(),body:JSON.stringify({version:cutVersion.value,effective_from:cutFrom.value,mappings})});
+      const j=await r.json().catch(()=>({}));
+      cutMsg.value=r.ok?('已切到 '+j.effective):(j.detail||'失败');
+      await refresh();
     }
     async function doRemap(){
       actionErr.value='';
@@ -88,7 +103,7 @@ createApp({
       await refresh();
     }
     onMounted(()=>{if(token.value)refresh();});
-    return {token,user,username,password,err,actionErr,leftTab,rightTab,versions,mappings,formal,conflicts,oldKey,login,logout,doRemap};
+    return {token,user,username,password,err,actionErr,leftTab,rightTab,versions,mappings,formal,conflicts,cutovers,reconcile,oldKey,cutVersion,cutFrom,cutText,cutMsg,login,logout,doRemap,doCutover};
   },
   template:`
   <div v-if="!token" class="login">
@@ -107,14 +122,15 @@ createApp({
         <div class="tabs">
           <button :class="{on:leftTab===0}" @click="leftTab=0">映射版本</button>
           <button :class="{on:leftTab===1}" @click="leftTab=1">执行重映</button>
+          <button :class="{on:leftTab===2}" @click="leftTab=2">切版</button>
         </div>
         <div class="box" v-show="leftTab===0">
           <h2>Map Versions</h2>
           <table><thead><tr><th>version</th><th>status</th><th>from</th></tr></thead>
-          <tbody><tr v-for="v in versions" :key="v.id"><td>{{v.version}}</td><td>{{v.status}}</td><td>{{v.effective_from}}</td></tr></tbody></table>
+          <tbody><tr v-for="v in versions" :key="v.id"><td>{{v.version}}</td><td :class="v.status==='生效'?'ok':''">{{v.status}}</td><td>{{v.effective_from}}</td></tr></tbody></table>
           <h2 style="margin-top:14px">Mappings</h2>
-          <table><thead><tr><th>old</th><th>new</th><th>kind</th></tr></thead>
-          <tbody><tr v-for="m in mappings" :key="m.id"><td>{{m.old_key}}</td><td class="ok">{{m.new_key}}</td><td>{{m.kind}}</td></tr></tbody></table>
+          <table><thead><tr><th>ver</th><th>old</th><th>new</th><th>kind</th></tr></thead>
+          <tbody><tr v-for="m in mappings" :key="m.id"><td>{{m.version}}</td><td>{{m.old_key}}</td><td class="ok">{{m.new_key}}</td><td>{{m.kind}}</td></tr></tbody></table>
         </div>
         <div class="box" v-show="leftTab===1">
           <h2>Ingress Remap</h2>
@@ -123,12 +139,23 @@ createApp({
           <button class="primary" @click="doRemap">重映入正式区</button>
           <div class="err">{{actionErr}}</div>
         </div>
+        <div class="box" v-show="leftTab===2">
+          <h2>Cutover（同事务关旧开新）</h2>
+          <label>version</label><input v-model="cutVersion"/>
+          <label>effective_from</label><input v-model="cutFrom"/>
+          <label>mappings（每行 old,new,kind）</label>
+          <textarea v-model="cutText" rows="4" style="width:100%;background:#000;border:1px solid #444;color:#fff;padding:10px;font-family:Consolas,monospace"></textarea>
+          <button class="primary" @click="doCutover">执行切版</button>
+          <div class="err">{{cutMsg}}</div>
+        </div>
       </div>
       <div class="bridge"></div>
       <div class="pane">
         <div class="tabs">
           <button :class="{on:rightTab===0}" @click="rightTab=0">正式区</button>
           <button :class="{on:rightTab===1}" @click="rightTab=1">冲突队列</button>
+          <button :class="{on:rightTab===2}" @click="rightTab=2">互证</button>
+          <button :class="{on:rightTab===3}" @click="rightTab=3">切版流水</button>
         </div>
         <div class="box" v-show="rightTab===0">
           <h2>Formal Zone</h2>
@@ -139,6 +166,21 @@ createApp({
           <h2>Conflicts</h2>
           <table><thead><tr><th>old</th><th>reason</th><th>status</th></tr></thead>
           <tbody><tr v-for="c in conflicts" :key="c.id"><td class="bad">{{c.old_key}}</td><td>{{c.reason}}</td><td>{{c.status}}</td></tr></tbody></table>
+        </div>
+        <div class="box" v-show="rightTab===2">
+          <h2>Reconcile（映射版本 × 正式区对账）</h2>
+          <p v-if="reconcile">
+            单生效：<span :class="reconcile.single_effective?'ok':'bad'">{{reconcile.single_effective?'仅一生效':'双生效！'}}</span>
+            ｜ 生效版：<b>{{reconcile.effective||'—'}}</b>
+            ｜ 一致：<span :class="reconcile.consistent?'ok':'bad'">{{reconcile.consistent?'同态':'失配'}}</span>
+          </p>
+          <table v-if="reconcile"><thead><tr><th>version</th><th>status</th><th>mappings</th><th>formal</th></tr></thead>
+          <tbody><tr v-for="v in reconcile.versions" :key="v.version"><td>{{v.version}}</td><td :class="v.status==='生效'?'ok':''">{{v.status}}</td><td>{{v.mappings}}</td><td>{{v.formal}}</td></tr></tbody></table>
+        </div>
+        <div class="box" v-show="rightTab===3">
+          <h2>Cut Ledger</h2>
+          <table><thead><tr><th>target</th><th>actor</th><th>result</th><th>detail</th><th>at</th></tr></thead>
+          <tbody><tr v-for="l in cutovers" :key="l.id"><td>{{l.target_version}}</td><td>{{l.actor}}</td><td :class="l.result==='已切'?'ok':'bad'">{{l.result}}</td><td>{{l.detail}}</td><td>{{l.created_at}}</td></tr></tbody></table>
         </div>
       </div>
     </div>
